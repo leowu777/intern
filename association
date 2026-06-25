@@ -1,0 +1,418 @@
+"""
+L1 — 关联发现：分组发病率 + 超几何检验 + FDR
+=============================================
+改进版 v2：
+  1. 分层 lift — 按 product 分层，防 Simpson 悖论
+  2. 嵌套去重 — Jaccard > 0.85 只留最具体属性
+  3. 最小支持度 — k≥2 + coverage≥0.5%
+  4. 时间窗参数化 — 全时段 + 近30天
+"""
+
+import os, sys, time, json
+from collections import defaultdict
+from itertools import combinations
+
+import numpy as np
+import pandas as pd
+from scipy.stats import hypergeom
+from statsmodels.stats.multitest import multipletests
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import STEP1_DIR, OUTPUT_DIR
+
+STEP3_DIR = os.path.join(OUTPUT_DIR, "step3_l1")
+os.makedirs(STEP3_DIR, exist_ok=True)
+
+# 配置
+MIN_SUPPORT_K = 2          # 最少命中集群数
+MIN_COVERAGE = 0.005       # 属性最少覆盖率（0.5%）
+JACCARD_THRESHOLD = 0.85   # 嵌套去重阈值
+RECENT_DAYS = 30           # 近期窗天数
+
+
+# ============================================================
+# 1. 加载数据
+# ============================================================
+def load_data():
+    print("加载数据...")
+    alerts = pd.read_csv(
+        os.path.join(STEP1_DIR, "unique_storage_alert.csv"),
+        usecols=['cluster_name', 'alert_type', 'product', 'first_alert_time', 'latest_alert_time'],
+        low_memory=False
+    )
+    # 时间列
+    for col in ['first_alert_time', 'latest_alert_time']:
+        alerts[col] = pd.to_datetime(alerts[col], errors='coerce')
+
+    disks = pd.read_csv(os.path.join(STEP1_DIR, "machine_disk_detail.csv"),
+        usecols=['cluster_name', 'disk_model', 'disk_firmware', 'disk_vendor'], low_memory=False)
+    cpus = pd.read_csv(os.path.join(STEP1_DIR, "machine_cpu_detail.csv"),
+        usecols=['cluster_name', 'cpu_model', 'cpu_vendor'], low_memory=False)
+    nics = pd.read_csv(os.path.join(STEP1_DIR, "machine_nic_detail.csv"),
+        usecols=['cluster_name', 'nic_model', 'nic_vendor'], low_memory=False)
+    machines = pd.read_csv(os.path.join(STEP1_DIR, "cds_machine_detail.csv"),
+        usecols=['cluster_name', 'machine_code', 'os_version'], low_memory=False)
+
+    print(f"  告警: {len(alerts):,} 行, {alerts['cluster_name'].nunique()} 集群")
+    print(f"  磁盘: {len(disks):,} 行 | CPU: {len(cpus):,} 行 | 网卡: {len(nics):,} 行 | 机器: {len(machines):,} 行")
+    return alerts, disks, cpus, nics, machines
+
+
+# ============================================================
+# 2. 构建集群-告警矩阵（支持时间窗）
+# ============================================================
+def build_matrix(alerts, window_days=None):
+    """
+    行=集群, 列=告警类型, 值=该集群是否触发过该告警
+    window_days=None → 全时段
+    window_days=30   → 只看近30天
+    """
+    if window_days:
+        cutoff = alerts['latest_alert_time'].max() - pd.Timedelta(days=window_days)
+        subset = alerts[alerts['latest_alert_time'] >= cutoff]
+        label = f"近{window_days}天"
+    else:
+        subset = alerts
+        label = "全时段"
+
+    subset = subset.dropna(subset=['cluster_name', 'alert_type'])
+    pairs = subset.groupby(['cluster_name', 'alert_type']).size().reset_index(name='count')
+    pairs['has_alert'] = 1
+    matrix = pairs.pivot_table(index='cluster_name', columns='alert_type',
+                               values='has_alert', fill_value=0)
+    print(f"  矩阵 [{label}]: {matrix.shape[0]} 集群 × {matrix.shape[1]} 告警类型, "
+          f"非零率 {(matrix.values.sum()/(matrix.shape[0]*matrix.shape[1]))*100:.1f}%")
+    return matrix
+
+
+# ============================================================
+# 3. 构建集群-硬件属性映射 + 集群-product 映射
+# ============================================================
+def build_hw_and_product_maps(disks, cpus, nics, machines, alerts):
+    hw = {}
+    product_map = {}
+
+    def add_attr(cluster, attr_prefix, value):
+        if pd.isna(value) or value == '':
+            return
+        if cluster not in hw:
+            hw[cluster] = {}
+        key = f"{attr_prefix}::{value}"
+        hw[cluster][key] = hw[cluster].get(key, 0) + 1
+
+    for cluster, group in disks.groupby('cluster_name'):
+        for _, row in group.iterrows():
+            add_attr(cluster, 'firmware', row['disk_firmware'])
+            add_attr(cluster, 'disk_model', row['disk_model'])
+            add_attr(cluster, 'disk_vendor', row['disk_vendor'])
+
+    for cluster, group in cpus.groupby('cluster_name'):
+        for _, row in group.iterrows():
+            add_attr(cluster, 'cpu_model', row['cpu_model'])
+            add_attr(cluster, 'cpu_vendor', row['cpu_vendor'])
+
+    for cluster, group in nics.groupby('cluster_name'):
+        for _, row in group.iterrows():
+            add_attr(cluster, 'nic_model', row['nic_model'])
+            add_attr(cluster, 'nic_vendor', row['nic_vendor'])
+
+    for cluster, group in machines.groupby('cluster_name'):
+        for _, row in group.iterrows():
+            add_attr(cluster, 'machine_code', row['machine_code'])
+            add_attr(cluster, 'os_version', row['os_version'])
+
+    # cluster → product（取该集群出现最多的 product）
+    if 'product' in alerts.columns:
+        for cluster, group in alerts.dropna(subset=['product']).groupby('cluster_name'):
+            product_map[cluster] = group['product'].mode().iloc[0] if len(group['product'].mode()) > 0 else 'unknown'
+
+    print(f"  有硬件数据的集群: {len(hw)}, 有 product 的集群: {len(product_map)}")
+    return hw, product_map
+
+
+# ============================================================
+# 4. 核心检验（含分层 lift）
+# ============================================================
+def run_tests(matrix, hw_map, product_map):
+    common = list(set(matrix.index) & set(hw_map.keys()))
+    N = len(common)
+    print(f"  共同集群: {N}")
+
+    sub = matrix.loc[common]
+    alert_types = list(sub.columns)
+    alert_counts = sub.sum(axis=0)
+    valid_alerts = alert_counts[(alert_counts >= MIN_SUPPORT_K) & (alert_counts <= N * 0.8)].index
+    print(f"  有效告警: {len(valid_alerts)}")
+
+    # 收集属性 → 集群集合
+    all_attrs = set()
+    for c in common:
+        all_attrs.update(hw_map[c].keys())
+
+    attr_clusters = {}
+    for attr in all_attrs:
+        clusters = set(c for c in common if attr in hw_map[c])
+        coverage = len(clusters) / N
+        if coverage >= MIN_COVERAGE:
+            attr_clusters[attr] = clusters
+    print(f"  有效属性: {len(attr_clusters)} (覆盖率≥{MIN_COVERAGE*100:.1f}%)")
+
+    results = []
+    total = len(attr_clusters) * len(valid_alerts)
+    print(f"  检验次数: {total:,}")
+    count = 0
+    t0 = time.time()
+
+    for attr, clusters in attr_clusters.items():
+        n = len(clusters)
+        clusters_list = list(clusters & set(common))
+
+        for alert_type in valid_alerts:
+            K = int(sub[alert_type].sum())
+            k = int(sub.loc[clusters_list, alert_type].sum())
+            if k < MIN_SUPPORT_K:
+                continue
+
+            rate_global = K / N
+            rate_group = k / n
+            lift = rate_group / rate_global if rate_global > 0 else 0
+            p_value = hypergeom.sf(k - 1, N, K, n)
+
+            # ——— 改进1: 分层 lift ———
+            stratified_lift, stratified_details = _calc_stratified_lift(
+                attr, alert_type, sub, hw_map, product_map, common, rate_global
+            )
+
+            results.append({
+                'attribute': attr,
+                'alert_type': alert_type,
+                'n': n, 'k': k, 'N': N, 'K': K,
+                'rate_global': round(rate_global, 6),
+                'rate_group': round(rate_group, 6),
+                'lift': round(lift, 4),
+                'p_value': p_value,
+                'stratified_lift': stratified_lift,
+                'stratified_details': json.dumps(stratified_details, ensure_ascii=False),
+                'confounded': stratified_lift is not None and stratified_lift < 1.5,
+            })
+            count += 1
+            if count % 50000 == 0:
+                print(f"    进度: {count:,}/{total:,} ({time.time()-t0:.1f}s)")
+
+    print(f"  有效检验: {len(results):,}")
+    return results
+
+
+def _calc_stratified_lift(attr, alert_type, matrix, hw_map, product_map, common, rate_global):
+    """
+    按 product 分层计算 lift。
+    如果属性只在一种 product 里出现，返回 None（无法分层）。
+    分层后各层 lift 的中位数，如果 < 1.5 则标记为 confounded。
+    """
+    if not product_map:
+        return None, {}
+
+    attr_type = attr.split('::')[0]
+    clusters_with_attr = set(c for c in common if attr in hw_map.get(c, {}))
+
+    # 收集这些集群涉及的所有 product
+    products = set()
+    for c in clusters_with_attr:
+        if c in product_map:
+            products.add(product_map[c])
+
+    if len(products) <= 1:
+        return None, {'note': '单产品，无法分层'}
+
+    # 每层算 lift
+    stratum_lifts = {}
+    for prod in products:
+        prod_clusters = set(c for c in common if product_map.get(c) == prod)
+        prod_N = len(prod_clusters)
+        if prod_N < 5:
+            continue
+
+        prod_with_attr = clusters_with_attr & prod_clusters
+        prod_n = len(prod_with_attr)
+        if prod_n < 2:
+            continue
+
+        prod_K = int(matrix.loc[list(prod_clusters), alert_type].sum())
+        prod_k = int(matrix.loc[list(prod_with_attr), alert_type].sum())
+
+        prod_rate_global = prod_K / prod_N if prod_N > 0 else 0
+        prod_rate_group = prod_k / prod_n if prod_n > 0 else 0
+        prod_lift = prod_rate_group / prod_rate_global if prod_rate_global > 0 else 0
+        stratum_lifts[prod] = {
+            'n': prod_n, 'N': prod_N,
+            'lift': round(prod_lift, 3),
+            'rate_group': round(prod_rate_group, 4),
+            'rate_global': round(prod_rate_global, 4),
+        }
+
+    if not stratum_lifts:
+        return None, {}
+
+    # 中位数 lift
+    lifts = [v['lift'] for v in stratum_lifts.values()]
+    median_lift = float(np.median(lifts))
+
+    return round(median_lift, 3), stratum_lifts
+
+
+# ============================================================
+# 5. FDR 校正
+# ============================================================
+def apply_fdr(results):
+    if not results:
+        return []
+    p_values = [r['p_value'] for r in results]
+    _, q_values, _, _ = multipletests(p_values, method='fdr_bh')
+    for i, r in enumerate(results):
+        r['q_value'] = q_values[i]
+    results.sort(key=lambda x: x['q_value'])
+
+    for threshold in [0.05, 0.01, 0.001]:
+        n = sum(1 for r in results if r['q_value'] < threshold)
+        print(f"  q < {threshold}: {n:,} 条")
+    return results
+
+
+# ============================================================
+# 6. 改进2: 嵌套去重
+# ============================================================
+def deduplicate(results, hw_map, common_clusters):
+    """Jaccard > 0.85 的冗余属性，只保留最具体的"""
+    print(f"\n嵌套去重（Jaccard > {JACCARD_THRESHOLD}）...")
+
+    sig = [r for r in results if r['q_value'] < 0.05 and not r['confounded']]
+    if not sig:
+        return results
+
+    # 收集所有显著属性
+    significant_attrs = set(r['attribute'] for r in sig)
+
+    # 构建属性 → 集群集合
+    attr_sets = {}
+    for attr in significant_attrs:
+        attr_sets[attr] = set(c for c in common_clusters if attr in hw_map.get(c, {}))
+
+    # 属性优先级：firmware > disk_model > cpu_model > nic_model > machine_code > disk_vendor > cpu_vendor > nic_vendor > os_version
+    priority = {
+        'firmware': 1, 'disk_model': 2, 'cpu_model': 3, 'nic_model': 4,
+        'machine_code': 5, 'disk_vendor': 6, 'cpu_vendor': 7, 'nic_vendor': 8, 'os_version': 9
+    }
+
+    def get_priority(attr):
+        return priority.get(attr.split('::')[0], 10)
+
+    # 找冗余对
+    attrs_list = sorted(significant_attrs, key=get_priority)
+    to_remove = set()
+    for i, a1 in enumerate(attrs_list):
+        if a1 in to_remove:
+            continue
+        s1 = attr_sets[a1]
+        for a2 in attrs_list[i + 1:]:
+            if a2 in to_remove:
+                continue
+            s2 = attr_sets[a2]
+            jaccard = len(s1 & s2) / len(s1 | s2) if len(s1 | s2) > 0 else 0
+            if jaccard > JACCARD_THRESHOLD:
+                # 保留更具体的（优先级数字更小的）
+                to_remove.add(a2 if get_priority(a1) <= get_priority(a2) else a1)
+
+    # 过滤
+    before = len(results)
+    results = [r for r in results if r['attribute'] not in to_remove]
+    print(f"  去重: {before:,} → {len(results):,} (移除 {len(to_remove)} 个冗余属性)")
+
+    # 重新排序
+    results.sort(key=lambda x: x['q_value'])
+    return results
+
+
+# ============================================================
+# 7. 跨告警关联
+# ============================================================
+def find_cross_alert_pairs(results, min_q=0.05):
+    print(f"\n寻找跨告警关联（q < {min_q}）...")
+    attr_map = defaultdict(list)
+    for r in results:
+        if r['q_value'] < min_q and not r.get('confounded', False):
+            attr_map[r['attribute']].append(r)
+
+    pairs = []
+    for attr, alerts in attr_map.items():
+        if len(alerts) < 2:
+            continue
+        for a1, a2 in combinations(alerts, 2):
+            pairs.append({
+                'attribute': attr,
+                'alert_type_1': a1['alert_type'], 'alert_type_2': a2['alert_type'],
+                'lift_1': a1['lift'], 'lift_2': a2['lift'],
+                'q_1': a1['q_value'], 'q_2': a2['q_value'],
+                'n_clusters': a1['n'],
+            })
+    pairs.sort(key=lambda x: min(x['q_1'], x['q_2']))
+    print(f"  跨告警关联对: {len(pairs):,}")
+    return pairs
+
+
+# ============================================================
+# 8. 主流程
+# ============================================================
+def run_pipeline(window_days, suffix):
+    alerts, disks, cpus, nics, machines = load_data()
+    matrix = build_matrix(alerts, window_days)
+    hw_map, product_map = build_hw_and_product_maps(disks, cpus, nics, machines, alerts)
+
+    common = list(set(matrix.index) & set(hw_map.keys()))
+    results = run_tests(matrix, hw_map, product_map)
+    if not results:
+        return
+    results = apply_fdr(results)
+    results = deduplicate(results, hw_map, common)
+
+    # 保存
+    df = pd.DataFrame(results)
+    out = os.path.join(STEP3_DIR, f"l1_associations_{suffix}.csv")
+    df.to_csv(out, index=False)
+    print(f"✅ 已保存: {out}")
+
+    # 摘要
+    sig = df[(df['q_value'] < 0.05) & (~df['confounded'])]
+    print(f"  显著且非混淆: {len(sig):,}")
+    print(f"  Top 5:")
+    for _, r in sig.head(5).iterrows():
+        print(f"    {r['attribute']} → {r['alert_type']}: lift={r['lift']:.1f}x, q={r['q_value']:.4f}")
+
+    return df, hw_map, common
+
+
+def main():
+    print("=" * 60)
+    print("L1 v2 — 分组发病率 + 超几何检验 + FDR")
+    print("改进: 分层lift | 嵌套去重 | 最小支持度 | 时间窗")
+    print("=" * 60)
+
+    t0 = time.time()
+
+    # 全时段
+    print("\n" + "─" * 40)
+    print("版本1: 全时段")
+    print("─" * 40)
+    df_full, hw_map, common = run_pipeline(window_days=None, suffix='full')
+
+    # 近30天
+    print("\n" + "─" * 40)
+    print("版本2: 近30天")
+    print("─" * 40)
+    df_recent, _, _ = run_pipeline(window_days=RECENT_DAYS, suffix='recent30d')
+
+    print(f"\n{'=' * 60}")
+    print(f"总耗时: {time.time() - t0:.1f}s")
+
+
+if __name__ == '__main__':
+    main()
